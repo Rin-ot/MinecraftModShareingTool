@@ -20,6 +20,9 @@ PROFILES_FILE = MINECRAFT_DIR / "launcher_profiles.json"
 VERSIONS_DIR = MINECRAFT_DIR / "versions"
 CONFIG_FILE = Path("config.json")
 
+if os.path.isfile(f"{os.path.expanduser('~')}/curseforge"):
+    CURSEFORGE_DIR = Path(f"{os.path.expanduser('~')}/curseforge")
+
 # --- ユーティリティ関数 ---
 
 def get_random_id(length=6):
@@ -47,6 +50,17 @@ class MinecraftManager:
         """launcher_profiles.jsonからプロファイル一覧を取得"""
         data = load_json(PROFILES_FILE)
         profiles = data.get("profiles", {})
+        if CURSEFORGE_DIR.exists():
+            cf_profiles = {}
+            for item in CURSEFORGE_DIR.iterdir():
+                if item.is_dir():
+                    profile_name = item.name
+                    cf_profiles[profile_name] = {
+                        "name": profile_name,
+                        "gameDir": str(item),
+                        "lastVersionId": "latest-release",
+                    }
+                    profiles.update(cf_profiles)
         return profiles
 
     @staticmethod
