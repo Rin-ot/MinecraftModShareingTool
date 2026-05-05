@@ -8,25 +8,31 @@ import string
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+from tkinter import ttk, messagebox, filedialog, simpledialog
 from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
+import hashlib
+import tempfile
+import requests
+import secrets
+import subprocess
 
-# --- 定数定義 ---
 APP_NAME = "Mod Share Tool"
-MINECRAFT_DIR = Path(os.getenv('APPDATA')) / ".minecraft"
+CURRENT_VERSION = "v1.0.0"
+UPDATE_REPO_OWNER = "Rin-ot"
+UPDATE_REPO_NAME = "MinecraftModShareingTool"
+
+MINECRAFT_DIR = Path(os.getenv('APPDATA', '')) / ".minecraft"
 PROFILES_FILE = MINECRAFT_DIR / "launcher_profiles.json"
 VERSIONS_DIR = MINECRAFT_DIR / "versions"
 CONFIG_FILE = Path("config.json")
+AUTH_FILE = Path("auth_tokens.json")
 
-if os.path.isfile(f"{os.path.expanduser('~')}/curseforge"):
-    CURSEFORGE_DIR = Path(f"{os.path.expanduser('~')}/curseforge")
-
-# --- ユーティリティ関数 ---
+# CurseForgeのディレクトリパスオブジェクトを常に定義しておく
+CURSEFORGE_DIR = Path.home() / "curseforge"
 
 def get_random_id(length=6):
-    """ランダムなIDを生成する"""
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 def load_json(path):
@@ -35,22 +41,95 @@ def load_json(path):
     try:
         with open(path, 'r', encoding='utf-8') as f:
             return json.load(f)
-    except Exception as e:
+    except Exception:
         return {}
 
 def save_json(path, data):
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-# --- コアロジック ---
+def format_size(size):
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size < 1024.0:
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TB"
+
+class AutoUpdater:
+    @staticmethod
+    def check_for_update(current_version, repo_owner, repo_name):
+        api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/releases/latest"
+        try:
+            resp = requests.get(api_url, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            latest_version = data.get("tag_name")
+            if latest_version and latest_version != current_version:
+                download_url = None
+                for asset in data.get("assets", []):
+                    if asset.get("name") == "mcms.exe":
+                        download_url = asset.get("browser_download_url")
+                        break
+                if download_url:
+                    return latest_version, download_url
+        except Exception:
+            pass
+        return None, None
+
+    @staticmethod
+    def apply_update(download_url):
+        if not getattr(sys, 'frozen', False):
+            return False
+
+        current_exe = sys.executable
+        if not current_exe.endswith("mcms.exe"):
+            return False
+
+        try:
+            temp_exe = current_exe + ".new"
+            resp = requests.get(download_url, stream=True, timeout=30)
+            resp.raise_for_status()
+            with open(temp_exe, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            bat_content = f'@echo off\ntimeout /t 2 /nobreak > NUL\nmove /y "{temp_exe}" "{current_exe}"\nstart "" "{current_exe}"\ndel "%~f0"\n'
+            bat_path = os.path.join(tempfile.gettempdir(), "update_mcms.bat")
+            with open(bat_path, "w", encoding="utf-8") as b:
+                b.write(bat_content)
+            
+            subprocess.Popen([bat_path], shell=True)
+            sys.exit(0)
+        except Exception:
+            return False
+
+class AuthManager:
+    @staticmethod
+    def generate_auth_token():
+        return secrets.token_hex(32)
+
+    @staticmethod
+    def hash_token(token):
+        return hashlib.sha256(token.encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def save_token(share_id, token):
+        data = load_json(AUTH_FILE)
+        data[share_id] = token
+        save_json(AUTH_FILE, data)
+
+    @staticmethod
+    def get_token(share_id):
+        return load_json(AUTH_FILE).get(share_id)
 
 class MinecraftManager:
     @staticmethod
     def get_profiles():
-        """launcher_profiles.jsonからプロファイル一覧を取得"""
         data = load_json(PROFILES_FILE)
         profiles = data.get("profiles", {})
-        if CURSEFORGE_DIR.exists():
+        
+        # 実際に存在し、かつディレクトリである場合のみ処理を実行する
+        if CURSEFORGE_DIR.exists() and CURSEFORGE_DIR.is_dir():
             cf_profiles = {}
             for item in CURSEFORGE_DIR.iterdir():
                 if item.is_dir():
@@ -60,26 +139,21 @@ class MinecraftManager:
                         "gameDir": str(item),
                         "lastVersionId": "latest-release",
                     }
-                    profiles.update(cf_profiles)
+            profiles.update(cf_profiles)
         return profiles
 
     @staticmethod
     def get_installed_versions():
-        """インストール済みのバージョンIDリストを取得"""
         if not VERSIONS_DIR.exists():
             return []
         return [d.name for d in VERSIONS_DIR.iterdir() if d.is_dir()]
 
     @staticmethod
     def create_zip_from_profile(profile_id, profile_data, output_path):
-        """指定されたプロファイルのModsとConfigをZip化する"""
         game_dir = profile_data.get("gameDir")
-        if game_dir:
-            base_path = Path(game_dir)
-        else:
-            base_path = MINECRAFT_DIR
-
+        base_path = Path(game_dir) if game_dir else MINECRAFT_DIR
         targets = ["mods", "config"]
+        preview_data = {"files": [], "total_size": 0}
         
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             has_files = False
@@ -91,6 +165,9 @@ class MinecraftManager:
                             arcname = file.relative_to(base_path)
                             zf.write(file, arcname)
                             has_files = True
+                            file_size = file.stat().st_size
+                            preview_data["files"].append({"name": str(arcname).replace('\\', '/'), "size": file_size})
+                            preview_data["total_size"] += file_size
             
             metadata = {
                 "lastVersionId": profile_data.get("lastVersionId", "latest-release")
@@ -99,13 +176,12 @@ class MinecraftManager:
             
             if not has_files:
                 raise FileNotFoundError("ModsまたはConfigフォルダが見つからないか、空です。")
+        return preview_data
 
     @staticmethod
     def install_modpack(zip_path, install_id):
-        """Zipを展開し、新しいプロファイルを作成する"""
         install_dir = VERSIONS_DIR / install_id
         install_dir.mkdir(parents=True, exist_ok=True)
-
         target_version_id = None
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(install_dir)
@@ -131,23 +207,17 @@ class MinecraftManager:
         profile_key = get_random_id(32).lower() 
         profile_data["profiles"][profile_key] = new_profile
         save_json(PROFILES_FILE, profile_data)
-
         return f"Shared-{install_id}"
 
     @staticmethod
     def check_and_prompt_version(version_id):
-        """バージョンがインストールされているか確認し、なければダウンロード誘導"""
         if not version_id:
             return
-
         installed = MinecraftManager.get_installed_versions()
-        
         if version_id in installed:
             return
-
         msg = f"バージョン '{version_id}' が見つかりません。\nMod Loaderをダウンロードしますか？"
         response = messagebox.askyesno("バージョン不足", msg)
-
         if response:
             url = MinecraftManager.generate_forge_url(version_id)
             webbrowser.open(url)
@@ -161,10 +231,9 @@ class MinecraftManager:
                 mc_ver = parts[0]
                 forge_ver = parts[-1]
                 return f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_ver}-{forge_ver}/forge-{mc_ver}-{forge_ver}-installer.jar"
-            
             if "fabric" in version_id:
                 return "https://fabricmc.net/use/installer/"
-        except:
+        except Exception:
             pass
         return "https://files.minecraftforge.net/"
 
@@ -186,18 +255,66 @@ class R2Manager:
                     aws_secret_access_key=self.config.get('secret_key')
                 )
                 self.bucket = self.config.get('bucket_name')
-            except:
+            except Exception:
                 self.client = None
 
-    def upload(self, file_path, object_name):
+    def upload(self, file_path, object_name, metadata=None):
         if not self.client: raise Exception("設定が完了していません")
-        self.client.upload_file(file_path, self.bucket, object_name)
+        extra_args = {}
+        if metadata:
+            extra_args['Metadata'] = metadata
+        self.client.upload_file(file_path, self.bucket, object_name, ExtraArgs=extra_args)
+
+    def upload_json(self, json_data, object_name):
+        if not self.client: raise Exception("設定が完了していません")
+        self.client.put_object(Body=json.dumps(json_data).encode('utf-8'), Bucket=self.bucket, Key=object_name)
 
     def download(self, object_name, save_path):
         if not self.client: raise Exception("設定が完了していません")
         self.client.download_file(self.bucket, object_name, save_path)
 
-# --- GUI アプリケーション ---
+    def download_json(self, object_name):
+        if not self.client: raise Exception("設定が完了していません")
+        response = self.client.get_object(Bucket=self.bucket, Key=object_name)
+        return json.loads(response['Body'].read().decode('utf-8'))
+
+    def get_metadata(self, object_name):
+        if not self.client: raise Exception("設定が完了していません")
+        try:
+            response = self.client.head_object(Bucket=self.bucket, Key=object_name)
+            return response.get('Metadata', {})
+        except ClientError:
+            return None
+
+    def delete(self, object_name):
+        if not self.client: raise Exception("設定が完了していません")
+        self.client.delete_object(Bucket=self.bucket, Key=object_name)
+
+class PreviewWindow(tk.Toplevel):
+    def __init__(self, parent, preview_data):
+        super().__init__(parent)
+        self.title("Mod Preview")
+        self.geometry("500x400")
+        self.transient(parent)
+        self.grab_set()
+
+        total_size = format_size(preview_data.get("total_size", 0))
+        ttk.Label(self, text=f"Total Size: {total_size}", font=("Arial", 10, "bold")).pack(pady=5)
+
+        columns = ("name", "size")
+        self.tree = ttk.Treeview(self, columns=columns, show="headings")
+        self.tree.heading("name", text="ファイル名")
+        self.tree.heading("size", text="サイズ")
+        self.tree.column("name", width=350)
+        self.tree.column("size", width=100, anchor="e")
+
+        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.pack(expand=True, fill="both", padx=10, pady=10)
+
+        for f in preview_data.get("files", []):
+            self.tree.insert("", tk.END, values=(f.get("name"), format_size(f.get("size", 0))))
 
 class ConfigWindow(tk.Toplevel):
     def __init__(self, parent):
@@ -206,36 +323,10 @@ class ConfigWindow(tk.Toplevel):
         self.geometry("400x350")
         self.resizable(False, False)
         self.parent = parent
-
-        icon_sett = f"""
-iVBORw0KGgoAAAANSUhEUgAAACQAAAAkCAMAAADW3miqAAAAw1BMVEUAAAAAAACA
-gIBVVVVVgIBtbW1ggIBddHRqgIBidnZtbYBidoBlcoBpdnxnc4Bld31odIBkdX1n
-c4BldX1mdn5kdIBndn5ldIBndYBlc35mdH5ndoBmdX5mdX5mdoBmdIBldX5mdX5n
-dIBldn5ndX9mdIBldX9mdYBmdoBmdX9ndIBmdX9ldYBmdX9mdYBldX9mdYBmdYBm
-dX9mdYBmdX9mdn9mdYBmdYBmdX9mdYBmdYBmdX9mdYBmdX9mdYBmdX/////JaS8q
-AAAAP3RSTlMAAQIDBgcICwwNDhomJyorLD0+P0FCQ0RISUtoaWtsbm9xcnmfoKGy
-tre4ubq7vr/A0tPU1dna4uPk9vf4+foNAEq3AAAAAWJLR0RA/tlc2AAAAUZJREFU
-OMu1lOlWgzAQhbEIpQIWcEVtS+0iWGzpJihg3v+tTAdIJiIWPcf5A9z5IJPLTCRJ
-jLs3QhJX+jkSQiM+AhGIv0N6lM6Ur5A6zyIdMXua8CllTgpoYlImoDevnIog4zsv
-hEXoBHCNKuYkJY3xzr40b4ZmDDp9amKeVV65GpTi2ut3u31vUz76CvbgArTsoVM8
-yoMcBEcwCvaVXXLhCqgQMya8d4+lIUgGUsDDdQdD8hZc5b1RhCf+qnGl085J2HbP
-RchiiVjinmgi1OMZBPVE6AxBrZZzk2OFx7fIgo0sWLBDFiAzBxga1cyUwoOSX3Ph
-5uOgLIQCHHgvH5YryiNgiI0ZxS+L3I4tTbMed9+0Squma9W+rQZhVRRghzy5sIsy
-l/XhNKrhNMrN7PEIr9JpbcyVabrU/+VU+eUh5sa8N1h8ApyRiuo4pAsUAAAAAElF
-TkSuQmCC
-"""
         
-        icon = tk.PhotoImage(data = icon_sett)
-        self.iconphoto(False, icon)
-
-        # --- 修正点: ウィンドウの挙動制御 ---
-        # 1. 親ウィンドウに対して一時的なウィンドウとして設定（常に手前に表示）
         self.transient(parent)
-        # 2. モーダル化（このウィンドウが開いている間、親ウィンドウの操作をブロック）
         self.grab_set()
-        # 3. フォーカスを強制的にこのウィンドウへ移動
         self.focus_force()
-        # -----------------------------------
         
         self.create_widgets()
         self.load_current_config()
@@ -248,7 +339,6 @@ TkSuQmCC
             ("Bucket Name", "bucket_name")
         ]
         self.entries = {}
-
         for i, (label_text, key) in enumerate(fields):
             lbl = ttk.Label(self, text=label_text)
             lbl.pack(pady=(10, 0), anchor="w", padx=20)
@@ -267,11 +357,9 @@ TkSuQmCC
     def save_config(self):
         data = {key: entry.get().strip() for key, entry in self.entries.items()}
         save_json(CONFIG_FILE, data)
-        
         if hasattr(self.parent, 'r2_manager'):
             self.parent.r2_manager.connect()
-            
-        messagebox.showinfo("保存", "設定を保存しました")
+        messagebox.showinfo("保存", "設定を保存しました", parent=self)
         self.destroy()
 
 class App(tk.Tk):
@@ -21785,20 +21873,53 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         icon = tk.PhotoImage(data = icon_data)
         self.iconphoto(False, icon)
 
-        self.r2_manager = R2Manager()
+        footer = tk.Label(
+            self, 
+            text = f"Ver: {CURRENT_VERSION} | Made by Rin-ot",
+            fg = "white", 
+            bg = "gray", 
+            font = ("Arial", 10), 
+            anchor = "w", 
+            padx = 10
+        )
+        footer.pack(
+            side = "bottom", 
+            fill = "x"
+        )
 
+        self.r2_manager = R2Manager()
         self.create_widgets()
         
-        # 初回起動チェック
-        # afterを使用することで、メインウィンドウの描画準備が整った直後に実行されるように調整
         if not CONFIG_FILE.exists():
             self.after(100, self.open_config)
 
+        threading.Thread(target=self.check_update, daemon=True).start()
+
+    def check_update(self):
+        latest, dl_url = AutoUpdater.check_for_update(CURRENT_VERSION, UPDATE_REPO_OWNER, UPDATE_REPO_NAME)
+        if latest and dl_url:
+            self.after(0, lambda: self.prompt_update(latest, dl_url))
+
+    def prompt_update(self, latest, dl_url):
+        if messagebox.askyesno("アップデート", f"新しいバージョン ({latest}) が利用可能です。\n自動アップデートを実行して再起動しますか？"):
+            threading.Thread(target=AutoUpdater.apply_update, args=(dl_url,), daemon=True).start()
+
+    def set_status_up(self, text, color="black"):
+        self.after(0, lambda: self.lbl_status_up.config(text=text, foreground=color))
+
+    def set_status_down(self, text, color="black"):
+        self.after(0, lambda: self.lbl_status_down.config(text=text, foreground=color))
+
+    def show_info(self, title, message):
+        self.after(0, lambda: messagebox.showinfo(title, message))
+
+    def show_error(self, title, message):
+        self.after(0, lambda: messagebox.showerror(title, message))
+
     def create_widgets(self):
         tab_control = ttk.Notebook(self)
-        
         tab_upload = ttk.Frame(tab_control)
-        tab_control.add(tab_upload, text='共有する (Upload)')
+        tab_control.add(tab_upload, text='共有・管理')
         self.setup_upload_tab(tab_upload)
         
         tab_download = ttk.Frame(tab_control)
@@ -21806,15 +21927,14 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         self.setup_download_tab(tab_download)
         
         tab_control.pack(expand=1, fill="both")
-
-        config_btn = ttk.Button(self, text="⚙ 設定", command=self.open_config, width=5)
-        config_btn.place(relx=1.0, rely=1.0, anchor="se", x=-10, y=-10)
+        config_btn = ttk.Button(self, text="⚙ 設定", command=self.open_config, width=10)
+        config_btn.place(relx=0.9, rely=1.0, anchor="se", x=-10, y=-10)
 
     def setup_upload_tab(self, parent):
         frame = ttk.Frame(parent, padding=20)
         frame.pack(fill="both", expand=True)
 
-        ttk.Label(frame, text="共有したいプロファイルを選択:").pack(anchor="w")
+        ttk.Label(frame, text="操作するプロファイルを選択:").pack(anchor="w")
 
         self.profile_var = tk.StringVar()
         self.profiles_map = MinecraftManager.get_profiles()
@@ -21825,7 +21945,6 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             p_type = val.get("type")
             if p_type in ["latest-release", "latest-snapshot"]:
                 continue
-
             name = val.get("name", "Unnamed")
             display = f"{name} ({val.get('lastVersionId', 'Unknown')})"
             profile_names.append(display)
@@ -21835,16 +21954,25 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         self.combo_profiles.pack(fill="x", pady=5)
         if profile_names: self.combo_profiles.current(0)
 
-        self.btn_upload = ttk.Button(frame, text="Zip作成 & アップロード", command=self.start_upload_thread)
-        self.btn_upload.pack(pady=20)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
 
-        ttk.Label(frame, text="共有ID:").pack(anchor="w")
+        self.btn_upload = ttk.Button(btn_frame, text="新規共有", command=self.start_upload_thread)
+        self.btn_upload.grid(row=0, column=0, padx=5)
+
+        self.btn_update = ttk.Button(btn_frame, text="更新", command=self.start_update_thread)
+        self.btn_update.grid(row=0, column=1, padx=5)
+
+        self.btn_delete = ttk.Button(btn_frame, text="削除", command=self.start_delete_thread)
+        self.btn_delete.grid(row=0, column=2, padx=5)
+
+        ttk.Label(frame, text="共有ID:").pack(anchor="w", pady=(10, 0))
         self.entry_share_id = ttk.Entry(frame, font=("Arial", 14, "bold"), justify="center")
         self.entry_share_id.pack(fill="x", pady=5)
         self.entry_share_id.config(state="readonly")
 
         self.lbl_status_up = ttk.Label(frame, text="待機中", foreground="gray")
-        self.lbl_status_up.pack(pady=10)
+        self.lbl_status_up.pack(pady=5)
 
     def setup_download_tab(self, parent):
         frame = ttk.Frame(parent, padding=20)
@@ -21855,14 +21983,29 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         self.entry_input_id = ttk.Entry(frame, font=("Arial", 14), justify="center")
         self.entry_input_id.pack(fill="x", pady=5)
 
-        self.btn_download = ttk.Button(frame, text="ダウンロード & インストール", command=self.start_download_thread)
-        self.btn_download.pack(pady=20)
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=20)
+
+        self.btn_preview = ttk.Button(btn_frame, text="プレビュー", command=self.start_preview_thread)
+        self.btn_preview.grid(row=0, column=0, padx=10)
+
+        self.btn_download = ttk.Button(btn_frame, text="ダウンロード & インストール", command=self.start_download_thread)
+        self.btn_download.grid(row=0, column=1, padx=10)
 
         self.lbl_status_down = ttk.Label(frame, text="待機中", foreground="gray")
         self.lbl_status_down.pack(pady=10)
 
     def open_config(self):
         ConfigWindow(self)
+
+    def toggle_upload_buttons(self, state):
+        self.btn_upload.config(state=state)
+        self.btn_update.config(state=state)
+        self.btn_delete.config(state=state)
+
+    def toggle_download_buttons(self, state):
+        self.btn_download.config(state=state)
+        self.btn_preview.config(state=state)
 
     def start_upload_thread(self):
         if not self.profile_var.get():
@@ -21871,8 +22014,8 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         threading.Thread(target=self.process_upload, daemon=True).start()
 
     def process_upload(self):
-        self.btn_upload.config(state="disabled")
-        self.lbl_status_up.config(text="処理中...", foreground="blue")
+        self.after(0, lambda: self.toggle_upload_buttons("disabled"))
+        self.set_status_up("処理中...", "blue")
         
         try:
             selected_display = self.profile_var.get()
@@ -21881,30 +22024,148 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
 
             share_id = get_random_id(6)
             zip_name = f"{share_id}.zip"
+            preview_name = f"{share_id}_preview.json"
             temp_zip = Path(zip_name)
 
-            self.lbl_status_up.config(text="ファイルを圧縮中...")
-            MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip)
+            token = AuthManager.generate_auth_token()
+            AuthManager.save_token(share_id, token)
+            token_hash = AuthManager.hash_token(token)
 
-            self.lbl_status_up.config(text="クラウドへアップロード中...")
-            self.r2_manager.upload(str(temp_zip), zip_name)
+            self.set_status_up("ファイルを圧縮中...", "blue")
+            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip)
 
-            self.entry_share_id.config(state="normal")
-            self.entry_share_id.delete(0, tk.END)
-            self.entry_share_id.insert(0, share_id)
-            self.entry_share_id.config(state="readonly")
+            self.set_status_up("クラウドへアップロード中...", "blue")
+            self.r2_manager.upload(str(temp_zip), zip_name, metadata={"tokenhash": token_hash})
+            self.r2_manager.upload_json(preview_data, preview_name)
+
+            self.after(0, lambda: self.entry_share_id.config(state="normal"))
+            self.after(0, lambda: self.entry_share_id.delete(0, tk.END))
+            self.after(0, lambda: self.entry_share_id.insert(0, share_id))
+            self.after(0, lambda: self.entry_share_id.config(state="readonly"))
             
             if temp_zip.exists():
                 os.remove(temp_zip)
 
-            self.lbl_status_up.config(text="完了しました！", foreground="green")
-            messagebox.showinfo("成功", f"アップロード完了！\nID: {share_id}")
+            self.set_status_up("完了しました！", "green")
+            self.show_info("成功", f"アップロード完了！\nID: {share_id}\n※次回以降の更新・削除のために認証トークンがローカルに保存されました。")
 
         except Exception as e:
-            self.lbl_status_up.config(text="エラー発生", foreground="red")
-            messagebox.showerror("エラー", str(e))
+            self.set_status_up("エラー発生", "red")
+            self.show_error("エラー", str(e))
         finally:
-            self.btn_upload.config(state="normal")
+            self.after(0, lambda: self.toggle_upload_buttons("normal"))
+
+    def start_update_thread(self):
+        if not self.profile_var.get():
+            messagebox.showwarning("警告", "更新元のプロファイルを選択してください")
+            return
+        share_id = simpledialog.askstring("更新", "更新する共有IDを入力してください:", parent=self)
+        if not share_id or len(share_id) != 6: return
+        threading.Thread(target=self.process_update, args=(share_id,), daemon=True).start()
+
+    def process_update(self, share_id):
+        self.after(0, lambda: self.toggle_upload_buttons("disabled"))
+        self.set_status_up("認証情報を確認中...", "blue")
+        try:
+            token = AuthManager.get_token(share_id)
+            if not token:
+                raise Exception("本人確認トークンがローカルに存在しません。")
+
+            meta = self.r2_manager.get_metadata(f"{share_id}.zip")
+            if meta is None:
+                raise Exception("対象のModがサーバー上に存在しません。")
+
+            remote_hash = meta.get("tokenhash")
+            if remote_hash != AuthManager.hash_token(token):
+                raise Exception("本人証明に失敗しました。トークンが一致しません。")
+
+            selected_display = self.profile_var.get()
+            profile_key = self.profile_key_map[selected_display]
+            profile_data = self.profiles_map[profile_key]
+
+            zip_name = f"{share_id}.zip"
+            preview_name = f"{share_id}_preview.json"
+            temp_zip = Path(zip_name)
+
+            self.set_status_up("ファイルを圧縮中...", "blue")
+            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip)
+
+            self.set_status_up("クラウドへアップロード中...", "blue")
+            self.r2_manager.upload(str(temp_zip), zip_name, metadata={"tokenhash": remote_hash})
+            self.r2_manager.upload_json(preview_data, preview_name)
+
+            if temp_zip.exists():
+                os.remove(temp_zip)
+
+            self.set_status_up("完了しました！", "green")
+            self.show_info("成功", f"ID: {share_id} のアップデートが完了しました！")
+
+        except Exception as e:
+            self.set_status_up("エラー発生", "red")
+            self.show_error("エラー", str(e))
+        finally:
+            self.after(0, lambda: self.toggle_upload_buttons("normal"))
+
+    def start_delete_thread(self):
+        share_id = simpledialog.askstring("削除", "削除する共有IDを入力してください:", parent=self)
+        if not share_id or len(share_id) != 6: return
+        if messagebox.askyesno("確認", f"本当にID: {share_id} を削除しますか？"):
+            threading.Thread(target=self.process_delete, args=(share_id,), daemon=True).start()
+
+    def process_delete(self, share_id):
+        self.after(0, lambda: self.toggle_upload_buttons("disabled"))
+        self.set_status_up("認証情報を確認中...", "blue")
+        try:
+            token = AuthManager.get_token(share_id)
+            if not token:
+                raise Exception("本人確認トークンがローカルに存在しません。")
+
+            meta = self.r2_manager.get_metadata(f"{share_id}.zip")
+            if meta is None:
+                raise Exception("対象のModがサーバー上に存在しません。")
+
+            remote_hash = meta.get("tokenhash")
+            if remote_hash != AuthManager.hash_token(token):
+                raise Exception("本人証明に失敗しました。トークンが一致しません。")
+
+            self.set_status_up("削除中...", "blue")
+            self.r2_manager.delete(f"{share_id}.zip")
+            try:
+                self.r2_manager.delete(f"{share_id}_preview.json")
+            except Exception:
+                pass
+
+            self.set_status_up("削除完了", "green")
+            self.show_info("成功", f"ID: {share_id} のプロファイルを削除しました。")
+
+        except Exception as e:
+            self.set_status_up("エラー発生", "red")
+            self.show_error("エラー", str(e))
+        finally:
+            self.after(0, lambda: self.toggle_upload_buttons("normal"))
+
+    def start_preview_thread(self):
+        input_id = self.entry_input_id.get().strip()
+        if len(input_id) != 6:
+            messagebox.showwarning("エラー", "IDは6文字です")
+            return
+        threading.Thread(target=self.process_preview, args=(input_id,), daemon=True).start()
+
+    def process_preview(self, share_id):
+        self.after(0, lambda: self.toggle_download_buttons("disabled"))
+        self.set_status_down("プレビュー情報取得中...", "blue")
+        try:
+            preview_data = self.r2_manager.download_json(f"{share_id}_preview.json")
+            self.set_status_down("取得完了", "green")
+            self.after(0, lambda: PreviewWindow(self, preview_data))
+        except ClientError:
+            self.set_status_down("取得失敗", "red")
+            self.show_error("エラー", "プレビュー情報が見つかりませんでした。")
+        except Exception as e:
+            self.set_status_down("エラー発生", "red")
+            self.show_error("エラー", str(e))
+        finally:
+            self.after(0, lambda: self.toggle_download_buttons("normal"))
 
     def start_download_thread(self):
         input_id = self.entry_input_id.get().strip()
@@ -21914,8 +22175,8 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
         threading.Thread(target=self.process_download, args=(input_id,), daemon=True).start()
 
     def process_download(self, share_id):
-        self.btn_download.config(state="disabled")
-        self.lbl_status_down.config(text="ダウンロード中...", foreground="blue")
+        self.after(0, lambda: self.toggle_download_buttons("disabled"))
+        self.set_status_down("ダウンロード中...", "blue")
         
         temp_zip = Path(f"download_{share_id}.zip")
         
@@ -21925,22 +22186,22 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             except ClientError:
                 raise Exception("IDが見つからないか、ダウンロードに失敗しました。")
 
-            self.lbl_status_down.config(text="インストール(展開)中...")
+            self.set_status_down("インストール(展開)中...", "blue")
             profile_name = MinecraftManager.install_modpack(str(temp_zip), share_id)
 
             if temp_zip.exists():
                 os.remove(temp_zip)
 
-            self.lbl_status_down.config(text="完了しました！", foreground="green")
-            messagebox.showinfo("成功", f"インストール完了！\n新しいプロファイル '{profile_name}' が追加されました。\nランチャーを再起動して確認してください。")
+            self.set_status_down("完了しました！", "green")
+            self.show_info("成功", f"インストール完了！\n新しいプロファイル '{profile_name}' が追加されました。\nランチャーを再起動して確認してください。")
 
         except Exception as e:
-            self.lbl_status_down.config(text="エラー発生", foreground="red")
-            messagebox.showerror("エラー", str(e))
+            self.set_status_down("エラー発生", "red")
+            self.show_error("エラー", str(e))
             if temp_zip.exists():
                 os.remove(temp_zip)
         finally:
-            self.btn_download.config(state="normal")
+            self.after(0, lambda: self.toggle_download_buttons("normal"))
 
 if __name__ == "__main__":
     app = App()
