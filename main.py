@@ -17,9 +17,10 @@ import tempfile
 import requests
 import secrets
 import subprocess
+import base64
 
 APP_NAME = "Mod Share Tool"
-CURRENT_VERSION = "v1.0.0"
+CURRENT_VERSION = "v1.1.0"
 UPDATE_REPO_OWNER = "Rin-ot"
 UPDATE_REPO_NAME = "MinecraftModShareingTool"
 
@@ -346,8 +347,44 @@ class ConfigWindow(tk.Toplevel):
             entry.pack(pady=(0, 5), padx=20)
             self.entries[key] = entry
 
+        key_frame = ttk.Frame(self)
+        key_frame.pack(pady=(15, 0), padx=20, fill="x")
+        
+        import_btn = ttk.Button(key_frame, text="キーからインポート", command=self.import_key)
+        import_btn.pack(side="left", expand=True, padx=(0, 5))
+        
+        export_btn = ttk.Button(key_frame, text="設定をキーとしてコピー", command=self.export_key)
+        export_btn.pack(side="left", expand=True, padx=(5, 0))
+
         save_btn = ttk.Button(self, text="保存", command=self.save_config)
         save_btn.pack(pady=20)
+
+    def import_key(self):
+        key = simpledialog.askstring("インポート", "共有キーを入力してください:", parent=self)
+        if key:
+            try:
+                reversed_key = key[::-1]
+                decoded_bytes = base64.b64decode(reversed_key.encode('utf-8'))
+                config = json.loads(decoded_bytes.decode('utf-8'))
+                for k, entry in self.entries.items():
+                    if k in config:
+                        entry.delete(0, tk.END)
+                        entry.insert(0, config[k])
+                messagebox.showinfo("成功", "設定を読み込みました。内容を確認して「保存」を押してください。", parent=self)
+            except Exception:
+                messagebox.showerror("エラー", "無効なキーです。正しい共有キーを入力してください。", parent=self)
+
+    def export_key(self):
+        data = {key: entry.get().strip() for key, entry in self.entries.items()}
+        try:
+            json_str = json.dumps(data)
+            encoded = base64.b64encode(json_str.encode('utf-8')).decode('utf-8')
+            share_key = encoded[::-1]
+            self.clipboard_clear()
+            self.clipboard_append(share_key)
+            messagebox.showinfo("成功", "クリップボードに共有キーをコピーしました。", parent=self)
+        except Exception:
+            messagebox.showerror("エラー", "キーの生成に失敗しました。", parent=self)
 
     def load_current_config(self):
         config = load_json(CONFIG_FILE)
