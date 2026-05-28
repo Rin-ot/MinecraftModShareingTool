@@ -18,9 +18,10 @@ import requests
 import secrets
 import subprocess
 import base64
+import uuid
 
 APP_NAME = "Mod Share Tool"
-CURRENT_VERSION = "v1.1.0"
+CURRENT_VERSION = "v1.1.1"
 UPDATE_REPO_OWNER = "Rin-ot"
 UPDATE_REPO_NAME = "MinecraftModShareingTool"
 
@@ -28,7 +29,6 @@ MINECRAFT_DIR = Path(os.getenv('APPDATA', '')) / ".minecraft"
 PROFILES_FILE = MINECRAFT_DIR / "launcher_profiles.json"
 VERSIONS_DIR = MINECRAFT_DIR / "versions"
 CONFIG_FILE = Path("config.json")
-AUTH_FILE = Path("auth_tokens.json")
 
 # CurseForgeのディレクトリパスオブジェクトを常に定義しておく
 CURSEFORGE_DIR = Path.home() / "curseforge"
@@ -106,6 +106,39 @@ class AutoUpdater:
 
 class AuthManager:
     @staticmethod
+    def get_client_id(root=None):
+        data = load_json(CONFIG_FILE)
+        if "client_id" not in data:
+            loading_win = None
+            try:
+                parent = root or tk._default_root
+                if parent:
+                    parent.update()
+                    loading_win = tk.Toplevel(parent)
+                    loading_win.title("処理中")
+                    loading_win.geometry("300x100")
+                    loading_win.resizable(False, False)
+                    loading_win.transient(parent)
+                    loading_win.grab_set()
+                    
+                    lbl = ttk.Label(loading_win, text="初回セットアップを処理しています...\nしばらくお待ちください。", justify="center")
+                    lbl.pack(expand=True)
+                    loading_win.update()
+            except Exception:
+                pass
+
+            data["client_id"] = str(uuid.uuid4())
+            save_json(CONFIG_FILE, data)
+            
+            if loading_win:
+                try:
+                    loading_win.destroy()
+                except Exception:
+                    pass
+
+        return data["client_id"]
+
+    @staticmethod
     def generate_auth_token():
         return secrets.token_hex(32)
 
@@ -115,13 +148,16 @@ class AuthManager:
 
     @staticmethod
     def save_token(share_id, token):
-        data = load_json(AUTH_FILE)
-        data[share_id] = token
-        save_json(AUTH_FILE, data)
+        data = load_json(CONFIG_FILE)
+        if "auth_tokens" not in data:
+            data["auth_tokens"] = {}
+        data["auth_tokens"][share_id] = token
+        save_json(CONFIG_FILE, data)
 
     @staticmethod
     def get_token(share_id):
-        return load_json(AUTH_FILE).get(share_id)
+        data = load_json(CONFIG_FILE)
+        return data.get("auth_tokens", {}).get(share_id)
 
 class MinecraftManager:
     @staticmethod
@@ -129,7 +165,6 @@ class MinecraftManager:
         data = load_json(PROFILES_FILE)
         profiles = data.get("profiles", {})
         
-        # 実際に存在し、かつディレクトリである場合のみ処理を実行する
         if CURSEFORGE_DIR.exists() and CURSEFORGE_DIR.is_dir():
             cf_profiles = {}
             for item in CURSEFORGE_DIR.iterdir():
@@ -321,7 +356,7 @@ class ConfigWindow(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
         self.title("設定")
-        self.geometry("400x350")
+        self.geometry("400x400")
         self.resizable(False, False)
         self.parent = parent
         
@@ -393,7 +428,9 @@ class ConfigWindow(tk.Toplevel):
 
     def save_config(self):
         data = {key: entry.get().strip() for key, entry in self.entries.items()}
-        save_json(CONFIG_FILE, data)
+        config = load_json(CONFIG_FILE)
+        config.update(data)
+        save_json(CONFIG_FILE, config)
         if hasattr(self.parent, 'r2_manager'):
             self.parent.r2_manager.connect()
         messagebox.showinfo("保存", "設定を保存しました", parent=self)
@@ -405,6 +442,8 @@ class App(tk.Tk):
         self.title(APP_NAME)
         self.geometry("500x400")
         self.resizable(False, False)
+        self.client_id = None
+        self.after(50, self.setup_client_id)
         icon_data = f"""
 iVBORw0KGgoAAAANSUhEUgAABAAAAAQACAYAAAB/HSuDAAAACXBIWXMAAAsTAAAL
 EwEAmpwYAAAGj2lUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJl
@@ -21931,6 +21970,9 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             self.after(100, self.open_config)
 
         threading.Thread(target=self.check_update, daemon=True).start()
+
+    def setup_client_id(self):
+        self.client_id = AuthManager.get_client_id(self)
 
     def check_update(self):
         latest, dl_url = AutoUpdater.check_for_update(CURRENT_VERSION, UPDATE_REPO_OWNER, UPDATE_REPO_NAME)
