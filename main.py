@@ -19,6 +19,7 @@ import secrets
 import subprocess
 import base64
 import uuid
+import struct
 
 APP_NAME = "Mod Share Tool"
 CURRENT_VERSION = "v1.1.1"
@@ -30,7 +31,6 @@ PROFILES_FILE = MINECRAFT_DIR / "launcher_profiles.json"
 VERSIONS_DIR = MINECRAFT_DIR / "versions"
 CONFIG_FILE = Path("config.json")
 
-# CurseForgeのディレクトリパスオブジェクトを常に定義しておく
 CURSEFORGE_DIR = Path.home() / "curseforge"
 
 def get_random_id(length=6):
@@ -55,6 +55,149 @@ def format_size(size):
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size:.1f} TB"
+
+class NBTReader:
+    def __init__(self, data):
+        self.data = data
+        self.offset = 0
+
+    def read_byte(self):
+        val = self.data[self.offset]
+        self.offset += 1
+        return val
+
+    def read_short(self):
+        val = struct.unpack(">H", self.data[self.offset:self.offset+2])[0]
+        self.offset += 2
+        return val
+        
+    def read_int(self):
+        val = struct.unpack(">I", self.data[self.offset:self.offset+4])[0]
+        self.offset += 4
+        return val
+
+    def read_string(self):
+        length = self.read_short()
+        val = self.data[self.offset:self.offset+length].decode('utf-8', errors='ignore')
+        self.offset += length
+        return val
+
+    def parse(self):
+        if self.offset >= len(self.data): return None
+        tag_type = self.read_byte()
+        if tag_type == 0: return None
+        self.read_string()
+        return self.parse_tag(tag_type)
+
+    def parse_tag(self, tag_type):
+        if tag_type == 1: return self.read_byte()
+        elif tag_type == 2:
+            self.offset += 2
+            return None
+        elif tag_type == 3: return self.read_int()
+        elif tag_type == 4:
+            self.offset += 8
+            return None
+        elif tag_type == 5:
+            self.offset += 4
+            return None
+        elif tag_type == 6:
+            self.offset += 8
+            return None
+        elif tag_type == 7:
+            length = self.read_int()
+            self.offset += length
+            return None
+        elif tag_type == 8: return self.read_string()
+        elif tag_type == 9:
+            item_type = self.read_byte()
+            length = self.read_int()
+            res = []
+            for _ in range(length):
+                res.append(self.parse_tag(item_type))
+            return res
+        elif tag_type == 10:
+            res = {}
+            while True:
+                if self.offset >= len(self.data): break
+                t = self.read_byte()
+                if t == 0: break
+                name = self.read_string()
+                res[name] = self.parse_tag(t)
+            return res
+        elif tag_type == 11:
+            length = self.read_int()
+            self.offset += length * 4
+            return None
+        elif tag_type == 12:
+            length = self.read_int()
+            self.offset += length * 8
+            return None
+        return None
+
+class NBTWriter:
+    def __init__(self):
+        self.data = bytearray()
+    
+    def write_byte(self, val):
+        self.data.append(val & 0xFF)
+        
+    def write_short(self, val):
+        self.data.extend(struct.pack(">H", val))
+        
+    def write_int(self, val):
+        self.data.extend(struct.pack(">I", val))
+        
+    def write_string(self, val):
+        bval = val.encode('utf-8')
+        self.write_short(len(bval))
+        self.data.extend(bval)
+
+def get_servers(dat_path):
+    if not dat_path.exists():
+        return []
+    try:
+        with open(dat_path, 'rb') as f:
+            data = f.read()
+        reader = NBTReader(data)
+        root = reader.parse()
+        if isinstance(root, dict) and "servers" in root:
+            servers = root["servers"]
+            return [{"name": s.get("name", "Unknown"), "ip": s.get("ip", "")} for s in servers if isinstance(s, dict)]
+    except Exception:
+        pass
+    return []
+
+def write_servers_dat(servers, output_path):
+    if not servers:
+        return
+    writer = NBTWriter()
+    writer.write_byte(10)
+    writer.write_string("")
+    
+    writer.write_byte(9)
+    writer.write_string("servers")
+    writer.write_byte(10)
+    writer.write_int(len(servers))
+    
+    for s in servers:
+        writer.write_byte(10)
+        writer.write_string("")
+        
+        writer.write_byte(8)
+        writer.write_string("name")
+        writer.write_string(s["name"])
+        
+        writer.write_byte(8)
+        writer.write_string("ip")
+        writer.write_string(s["ip"])
+        
+        writer.write_byte(0)
+        
+    writer.write_byte(0)
+    
+    with open(output_path, 'wb') as f:
+        f.write(writer.data)
 
 class AutoUpdater:
     @staticmethod
@@ -185,7 +328,7 @@ class MinecraftManager:
         return [d.name for d in VERSIONS_DIR.iterdir() if d.is_dir()]
 
     @staticmethod
-    def create_zip_from_profile(profile_id, profile_data, output_path):
+    def create_zip_from_profile(profile_id, profile_data, output_path, selected_servers=None):
         game_dir = profile_data.get("gameDir")
         base_path = Path(game_dir) if game_dir else MINECRAFT_DIR
         targets = ["mods", "config"]
@@ -208,7 +351,9 @@ class MinecraftManager:
             metadata = {
                 "lastVersionId": profile_data.get("lastVersionId", "latest-release")
             }
-            zf.writestr("share_meta.json", json.dumps(metadata))
+            if selected_servers:
+                metadata["servers"] = selected_servers
+            zf.writestr("share_meta.json", json.dumps(metadata, ensure_ascii=False))
             
             if not has_files:
                 raise FileNotFoundError("ModsまたはConfigフォルダが見つからないか、空です。")
@@ -219,13 +364,19 @@ class MinecraftManager:
         install_dir = VERSIONS_DIR / install_id
         install_dir.mkdir(parents=True, exist_ok=True)
         target_version_id = None
+        shared_servers = None
+        
         with zipfile.ZipFile(zip_path, 'r') as zf:
             zf.extractall(install_dir)
             if "share_meta.json" in zf.namelist():
                 meta = json.loads(zf.read("share_meta.json"))
                 target_version_id = meta.get("lastVersionId")
+                shared_servers = meta.get("servers")
 
         MinecraftManager.check_and_prompt_version(target_version_id)
+        
+        if shared_servers:
+            write_servers_dat(shared_servers, install_dir / "servers.dat")
 
         profile_data = load_json(PROFILES_FILE)
         if "profiles" not in profile_data:
@@ -434,6 +585,50 @@ class ConfigWindow(tk.Toplevel):
         if hasattr(self.parent, 'r2_manager'):
             self.parent.r2_manager.connect()
         messagebox.showinfo("保存", "設定を保存しました", parent=self)
+        self.destroy()
+
+class ServerSelectWindow(tk.Toplevel):
+    def __init__(self, parent, servers):
+        super().__init__(parent)
+        self.title("共有サーバーの選択")
+        self.geometry("350x400")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        
+        self.selected_servers = []
+        self.server_data = servers
+        
+        lbl = ttk.Label(self, text="共有するサーバーを選択してください\n（複数選択可、未選択でキャンセル）", justify="center")
+        lbl.pack(pady=10)
+        
+        frame = ttk.Frame(self)
+        frame.pack(expand=True, fill="both", padx=20, pady=5)
+        
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        self.listbox = tk.Listbox(frame, selectmode=tk.MULTIPLE, yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.listbox.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.listbox.pack(side=tk.LEFT, expand=True, fill="both")
+        
+        for s in servers:
+            self.listbox.insert(tk.END, f"{s['name']} ({s['ip']})")
+            
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=10)
+        
+        ttk.Button(btn_frame, text="決定", command=self.confirm).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="キャンセル", command=self.cancel).pack(side=tk.LEFT, padx=5)
+        
+        self.wait_window(self)
+        
+    def confirm(self):
+        indices = self.listbox.curselection()
+        self.selected_servers = [self.server_data[i] for i in indices]
+        self.destroy()
+        
+    def cancel(self):
+        self.selected_servers = []
         self.destroy()
 
 class App(tk.Tk):
@@ -22101,6 +22296,22 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             profile_key = self.profile_key_map[selected_display]
             profile_data = self.profiles_map[profile_key]
 
+            share_servers = messagebox.askyesno("サーバーIP共有", "サーバーIP設定（servers.dat）も共有しますか？", parent=self)
+            selected_servers = None
+
+            if share_servers:
+                game_dir = profile_data.get("gameDir")
+                base_path = Path(game_dir) if game_dir else MINECRAFT_DIR
+                servers_dat_path = base_path / "servers.dat"
+                
+                servers = get_servers(servers_dat_path)
+                if not servers:
+                    messagebox.showinfo("通知", "共有可能なサーバーが見つかりませんでした。", parent=self)
+                else:
+                    dialog = ServerSelectWindow(self, servers)
+                    if dialog.selected_servers:
+                        selected_servers = dialog.selected_servers
+
             share_id = get_random_id(6)
             zip_name = f"{share_id}.zip"
             preview_name = f"{share_id}_preview.json"
@@ -22111,7 +22322,7 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             token_hash = AuthManager.hash_token(token)
 
             self.set_status_up("ファイルを圧縮中...", "blue")
-            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip)
+            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip, selected_servers)
 
             self.set_status_up("クラウドへアップロード中...", "blue")
             self.r2_manager.upload(str(temp_zip), zip_name, metadata={"tokenhash": token_hash})
@@ -22162,12 +22373,28 @@ ffTRRx999NFHH3300UcfffTxGIwOAPTRRx999NFHH3300UcfffTRx2MwOgDQRx99
             profile_key = self.profile_key_map[selected_display]
             profile_data = self.profiles_map[profile_key]
 
+            share_servers = messagebox.askyesno("サーバーIP共有", "サーバーIP設定（servers.dat）も共有しますか？", parent=self)
+            selected_servers = None
+
+            if share_servers:
+                game_dir = profile_data.get("gameDir")
+                base_path = Path(game_dir) if game_dir else MINECRAFT_DIR
+                servers_dat_path = base_path / "servers.dat"
+                
+                servers = get_servers(servers_dat_path)
+                if not servers:
+                    messagebox.showinfo("通知", "共有可能なサーバーが見つかりませんでした。", parent=self)
+                else:
+                    dialog = ServerSelectWindow(self, servers)
+                    if dialog.selected_servers:
+                        selected_servers = dialog.selected_servers
+
             zip_name = f"{share_id}.zip"
             preview_name = f"{share_id}_preview.json"
             temp_zip = Path(zip_name)
 
             self.set_status_up("ファイルを圧縮中...", "blue")
-            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip)
+            preview_data = MinecraftManager.create_zip_from_profile(profile_key, profile_data, temp_zip, selected_servers)
 
             self.set_status_up("クラウドへアップロード中...", "blue")
             self.r2_manager.upload(str(temp_zip), zip_name, metadata={"tokenhash": remote_hash})
