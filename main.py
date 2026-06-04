@@ -22,7 +22,7 @@ import uuid
 import struct
 
 APP_NAME = "Mod Share Tool"
-CURRENT_VERSION = "v1.2.0"
+CURRENT_VERSION = "v1.2.1"
 UPDATE_REPO_OWNER = "Rin-ot"
 UPDATE_REPO_NAME = "MinecraftModShareingTool"
 
@@ -211,7 +211,7 @@ class AutoUpdater:
             if latest_version and latest_version != current_version:
                 download_url = None
                 for asset in data.get("assets", []):
-                    if asset.get("name") == "mcms.exe":
+                    if asset.get("name") == "MCMS.exe":
                         download_url = asset.get("browser_download_url")
                         break
                 if download_url:
