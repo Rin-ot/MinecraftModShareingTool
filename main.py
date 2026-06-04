@@ -22,7 +22,7 @@ import uuid
 import struct
 
 APP_NAME = "Mod Share Tool"
-CURRENT_VERSION = "v1.1.1"
+CURRENT_VERSION = "v1.2.0"
 UPDATE_REPO_OWNER = "Rin-ot"
 UPDATE_REPO_NAME = "MinecraftModShareingTool"
 
