@@ -20,9 +20,10 @@ import subprocess
 import base64
 import uuid
 import struct
+import urllib.request
 
 APP_NAME = "Mod Share Tool"
-CURRENT_VERSION = "v1.2.1"
+CURRENT_VERSION = "v1.3.0"
 UPDATE_REPO_OWNER = "Rin-ot"
 UPDATE_REPO_NAME = "MinecraftModShareingTool"
 
@@ -302,6 +303,68 @@ class AuthManager:
         data = load_json(CONFIG_FILE)
         return data.get("auth_tokens", {}).get(share_id)
 
+class JavaManager:
+    JRE_DIR = Path("jre")
+    
+    @classmethod
+    def get_java_path(cls):
+        local_java = cls.JRE_DIR / "bin" / "java.exe"
+        if local_java.exists():
+            return str(local_java)
+        try:
+            result = subprocess.run(["java", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            if result.returncode == 0:
+                return "java"
+        except FileNotFoundError:
+            pass
+        mc_runtime_path = Path(os.getenv('APPDATA', '')) / ".minecraft" / "runtime"
+        if mc_runtime_path.exists():
+            for root, dirs, files in os.walk(mc_runtime_path):
+                if "java.exe" in files:
+                    return os.path.join(root, "java.exe")
+        return None
+
+    @classmethod
+    def download_and_extract_jre(cls, progress_callback=None):
+        url = "https://api.adoptium.net/v3/binary/latest/17/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk"
+        zip_path = Path("jre_temp.zip")
+        try:
+            if progress_callback: progress_callback("Java (JRE) をダウンロード中...", 0)
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response:
+                total_size = int(response.headers.get('content-length', 0))
+                downloaded = 0
+                with open(zip_path, 'wb') as out_file:
+                    chunk_size = 8192
+                    while True:
+                        buffer = response.read(chunk_size)
+                        if not buffer: break
+                        out_file.write(buffer)
+                        downloaded += len(buffer)
+                        if total_size > 0 and progress_callback:
+                            progress_callback(f"Java (JRE) をダウンロード中... ({int(downloaded/1024/1024)}/{int(total_size/1024/1024)} MB)", (downloaded / total_size) * 50)
+            if progress_callback: progress_callback("Java (JRE) を展開中...", 50)
+            if cls.JRE_DIR.exists(): shutil.rmtree(cls.JRE_DIR, ignore_errors=True)
+            cls.JRE_DIR.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                top_level_dirs = set(Path(item.filename).parts[0] for item in zip_ref.infolist() if '/' in item.filename)
+                top_level_dir = list(top_level_dirs)[0] if top_level_dirs else ""
+                total_files = len(zip_ref.infolist())
+                for i, item in enumerate(zip_ref.infolist()):
+                    zip_ref.extract(item, path="jre_extract_temp")
+                    if i % 50 == 0 and progress_callback:
+                        progress_callback("Java (JRE) を展開中...", 50 + (i / total_files) * 50)
+            temp_extract = Path("jre_extract_temp") / top_level_dir
+            for item in temp_extract.iterdir():
+                shutil.move(str(item), str(cls.JRE_DIR / item.name))
+            shutil.rmtree("jre_extract_temp", ignore_errors=True)
+            zip_path.unlink(missing_ok=True)
+            return True
+        except Exception as e:
+            if zip_path.exists(): zip_path.unlink(missing_ok=True)
+            if Path("jre_extract_temp").exists(): shutil.rmtree("jre_extract_temp", ignore_errors=True)
+            return False
+
 class MinecraftManager:
     @staticmethod
     def get_profiles():
@@ -397,18 +460,96 @@ class MinecraftManager:
         return f"Shared-{install_id}"
 
     @staticmethod
-    def check_and_prompt_version(version_id):
+    def check_and_prompt_version(version_id, parent_window=None):
         if not version_id:
             return
         installed = MinecraftManager.get_installed_versions()
         if version_id in installed:
             return
-        msg = f"バージョン '{version_id}' が見つかりません。\nMod Loaderをダウンロードしますか？"
-        response = messagebox.askyesno("バージョン不足", msg)
+        msg = f"バージョン '{version_id}' が見つかりません。\n自動的にJavaおよびMod Loaderをインストールしますか？"
+        response = messagebox.askyesno("バージョン不足", msg, parent=parent_window)
         if response:
+            MinecraftManager._run_automated_installer(version_id, parent_window)
+
+    @staticmethod
+    def _run_automated_installer(version_id, parent_window=None):
+        progress_win = tk.Toplevel(parent_window)
+        progress_win.title("インストール中")
+        progress_win.geometry("400x150")
+        progress_win.transient(parent_window)
+        progress_win.grab_set()
+        
+        tk.Label(progress_win, text=f"{version_id} のインストールを準備中...").pack(pady=10)
+        status_var = tk.StringVar(value="準備中...")
+        tk.Label(progress_win, textvariable=status_var).pack()
+        progress_bar = ttk.Progressbar(progress_win, length=300, mode='determinate')
+        progress_bar.pack(pady=10)
+
+        def update_progress(msg, value):
+            progress_win.after(0, lambda: status_var.set(msg))
+            progress_win.after(0, lambda: progress_bar.config(value=value))
+
+        def install_thread():
+            java_path = JavaManager.get_java_path()
+            if not java_path:
+                update_progress("Javaが見つかりません。ダウンロード中...", 0)
+                success = JavaManager.download_and_extract_jre(update_progress)
+                if not success:
+                    progress_win.after(0, lambda: messagebox.showerror("エラー", "Javaのダウンロードに失敗しました。", parent=progress_win))
+                    progress_win.after(0, progress_win.destroy)
+                    return
+                java_path = JavaManager.get_java_path()
+                if not java_path:
+                    progress_win.after(0, lambda: messagebox.showerror("エラー", "Javaのインストールに失敗しました。", parent=progress_win))
+                    progress_win.after(0, progress_win.destroy)
+                    return
+
+            update_progress("インストーラーをダウンロード中...", 0)
             url = MinecraftManager.generate_forge_url(version_id)
-            webbrowser.open(url)
-            messagebox.showinfo("案内", "ブラウザを開きました。インストール完了後にランチャーを再起動してください。")
+            installer_jar = Path("installer_temp.jar")
+            try:
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req) as response:
+                    total_size = int(response.headers.get('content-length', 0))
+                    downloaded = 0
+                    with open(installer_jar, 'wb') as out_file:
+                        chunk_size = 8192
+                        while True:
+                            buffer = response.read(chunk_size)
+                            if not buffer: break
+                            out_file.write(buffer)
+                            downloaded += len(buffer)
+                            if total_size > 0:
+                                update_progress(f"インストーラーをダウンロード中... ({int(downloaded/1024)}/{int(total_size/1024)} KB)", (downloaded / total_size) * 100)
+            except Exception as e:
+                progress_win.after(0, lambda: messagebox.showerror("エラー", f"インストーラーのダウンロードに失敗しました: {e}", parent=progress_win))
+                progress_win.after(0, progress_win.destroy)
+                return
+
+            update_progress("インストールを実行中...", 100)
+            progress_win.after(0, lambda: progress_bar.config(mode='indeterminate'))
+            progress_win.after(0, progress_bar.start)
+
+            try:
+                if "fabric" in version_id.lower():
+                    cmd = [java_path, "-jar", str(installer_jar), "client", "-dir", str(MINECRAFT_DIR)]
+                else:
+                    cmd = [java_path, "-jar", str(installer_jar), "--installClient"]
+                
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                if result.returncode == 0:
+                    progress_win.after(0, lambda: messagebox.showinfo("完了", "インストールが完了しました。ランチャーを再起動してください。", parent=parent_window))
+                else:
+                    progress_win.after(0, lambda: messagebox.showerror("エラー", f"インストールに失敗しました:\n{result.stderr}", parent=parent_window))
+            except Exception as e:
+                progress_win.after(0, lambda: messagebox.showerror("エラー", f"インストール実行中にエラーが発生しました:\n{e}", parent=parent_window))
+            finally:
+                if installer_jar.exists():
+                    installer_jar.unlink(missing_ok=True)
+                progress_win.after(0, progress_bar.stop)
+                progress_win.after(0, progress_win.destroy)
+
+        threading.Thread(target=install_thread, daemon=True).start()
 
     @staticmethod
     def generate_forge_url(version_id):
@@ -418,8 +559,8 @@ class MinecraftManager:
                 mc_ver = parts[0]
                 forge_ver = parts[-1]
                 return f"https://maven.minecraftforge.net/net/minecraftforge/forge/{mc_ver}-{forge_ver}/forge-{mc_ver}-{forge_ver}-installer.jar"
-            if "fabric" in version_id:
-                return "https://fabricmc.net/use/installer/"
+            if "fabric" in version_id.lower():
+                return "https://maven.fabricmc.net/net/fabricmc/fabric-installer/1.0.1/fabric-installer-1.0.1.jar"
         except Exception:
             pass
         return "https://files.minecraftforge.net/"
