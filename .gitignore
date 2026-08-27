@@ -1,2 +1,8 @@
 *.json
 app_convert.bat
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
